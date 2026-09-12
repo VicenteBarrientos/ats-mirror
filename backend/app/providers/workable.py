@@ -74,6 +74,8 @@ class WorkableATSProvider(ATSProvider):
         self._candidate_jobs: dict[str, str] = {}
         self._account_name = self._subdomain
         self._reported_subdomain = self._subdomain
+        self._rate_remaining: int | None = None
+        self._rate_reset_at: float | None = None
 
     @property
     def name(self) -> str:
@@ -357,6 +359,7 @@ class WorkableATSProvider(ATSProvider):
         last_error: Exception | None = None
         attempts = max(self._retries, 0) + 1
         for attempt in range(attempts):
+            self._wait_if_rate_window_exhausted()
             try:
                 response = self._client.get(url, params=params)
             except httpx.HTTPError as exc:
@@ -365,11 +368,40 @@ class WorkableATSProvider(ATSProvider):
                     time.sleep(0.05 * (attempt + 1))
                     continue
                 raise ProviderUnavailableError("Workable API is unreachable.") from exc
+            self._note_rate_limit(response)
             if response.status_code in {429, 500, 502, 503, 504} and attempt < attempts - 1:
-                time.sleep(0.05 * (attempt + 1))
+                time.sleep(_retry_delay_seconds(response, attempt))
+                if response.status_code == 429:
+                    self._rate_remaining = None
                 continue
             return self._parse_response(response, url)
         raise ProviderUnavailableError("Workable API is unreachable.") from last_error
+
+    def _note_rate_limit(self, response: httpx.Response) -> None:
+        remaining = _header(response, "X-Rate-Limit-Remaining")
+        reset = _header(response, "X-Rate-Limit-Reset")
+        if remaining is not None:
+            try:
+                self._rate_remaining = int(remaining)
+            except ValueError:
+                self._rate_remaining = None
+        reset_at = _parse_reset_timestamp(reset)
+        if reset_at is not None:
+            self._rate_reset_at = reset_at
+
+    def _wait_if_rate_window_exhausted(self) -> None:
+        if self._rate_remaining is None or self._rate_remaining > 0:
+            return
+        delay = _seconds_until(self._rate_reset_at)
+        if delay <= 0:
+            self._rate_remaining = None
+            return
+        logger.info(
+            "Workable rate window exhausted; waiting",
+            extra={"extra_fields": {"delay_seconds": round(delay, 3)}},
+        )
+        time.sleep(delay)
+        self._rate_remaining = None
 
     def _parse_response(self, response: httpx.Response, url: str) -> dict[str, Any]:
         path = urlparse(url).path
@@ -393,3 +425,53 @@ class WorkableATSProvider(ATSProvider):
         if not isinstance(payload, dict):
             raise ValueError("Workable response was not an object")
         return payload
+
+
+_MAX_RATE_WAIT_SECONDS = 30.0
+
+
+def _header(response: httpx.Response, name: str) -> str | None:
+    value = response.headers.get(name)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _parse_reset_timestamp(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        parsed = float(value)
+    except ValueError:
+        return None
+    if parsed > 1_000_000_000_000:
+        parsed /= 1000.0
+    return parsed
+
+
+def _seconds_until(reset_at: float | None, *, now: float | None = None) -> float:
+    if reset_at is None:
+        return 0.0
+    current = time.time() if now is None else now
+    delay = reset_at - current
+    if delay <= 0:
+        return 0.0
+    return min(delay, _MAX_RATE_WAIT_SECONDS)
+
+
+def _retry_delay_seconds(response: httpx.Response, attempt: int) -> float:
+    if response.status_code == 429:
+        reset_delay = _seconds_until(_parse_reset_timestamp(_header(response, "X-Rate-Limit-Reset")))
+        if reset_delay > 0:
+            return reset_delay
+        retry_after = _header(response, "Retry-After")
+        if retry_after is not None:
+            try:
+                parsed = float(retry_after)
+            except ValueError:
+                parsed = 0.0
+            if parsed > 0:
+                return min(parsed, _MAX_RATE_WAIT_SECONDS)
+        return float(min(2**attempt, 16))
+    return 0.05 * (attempt + 1)

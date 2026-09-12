@@ -291,6 +291,64 @@ def test_workable_health_unauthorized_does_not_leak_token() -> None:
     assert "Bearer" not in health.message
 
 
+def test_workable_retries_429_using_reset_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr("app.providers.workable.time.sleep", lambda seconds: sleeps.append(seconds))
+    now = 1_800_000_000.0
+    monkeypatch.setattr("app.providers.workable.time.time", lambda: now)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(
+                429,
+                headers={"X-Rate-Limit-Reset": str(int(now + 7)), "X-Rate-Limit-Remaining": "0"},
+            )
+        query = parse_qs(urlparse(str(request.url)).query)
+        state = query.get("state", [""])[0]
+        return _json(request, {"jobs": [JOB_B] if state == "published" else []})
+
+    jobs = list(_provider(handler).iter_jobs())
+    assert [job.external_id for job in jobs] == ["GROOV005"]
+    assert sleeps[0] == pytest.approx(7.0)
+
+
+def test_workable_429_without_headers_uses_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr("app.providers.workable.time.sleep", lambda seconds: sleeps.append(seconds))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429)
+
+    with pytest.raises(ProviderUnavailableError) as exc:
+        list(_provider(handler).iter_jobs())
+    assert exc.value.status_code == 429
+    assert sleeps[0] == 1.0
+    assert 0.05 not in sleeps[:1]
+
+
+def test_workable_waits_when_remaining_is_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr("app.providers.workable.time.sleep", lambda seconds: sleeps.append(seconds))
+    now = 1_800_000_100.0
+    monkeypatch.setattr("app.providers.workable.time.time", lambda: now)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        query = parse_qs(urlparse(str(request.url)).query)
+        state = query.get("state", [""])[0]
+        remaining = "0" if state == "published" else "9"
+        return httpx.Response(
+            200,
+            json={"jobs": [JOB_B] if state == "published" else []},
+            headers={"X-Rate-Limit-Remaining": remaining, "X-Rate-Limit-Reset": str(int(now + 4))},
+        )
+
+    jobs = list(_provider(handler).iter_jobs())
+    assert [job.external_id for job in jobs] == ["GROOV005"]
+    assert any(item == pytest.approx(4.0) for item in sleeps)
+
+
 def test_workable_rejects_non_get_in_transport() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"

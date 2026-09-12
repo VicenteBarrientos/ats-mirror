@@ -9,6 +9,8 @@ Evidence for ATS Mirror's canonical schema, based on:
 
 Auth for ATS Mirror itself: `Authorization: Bearer <account token>` with scopes `r_jobs` and `r_candidates`. Subdomain is the connection account id. Secrets stay in env (`WORKABLE_SUBDOMAIN`, `WORKABLE_ACCESS_TOKEN`).
 
+Official account-token rate limit: **10 requests / 10 seconds**. Responses include `X-Rate-Limit-Limit`, `X-Rate-Limit-Remaining`, and `X-Rate-Limit-Reset` (unix timestamp of the next interval). HTTP 429 means wait until reset — a 50ms retry is not enough. ATS Mirror honors those headers and falls back to exponential backoff if they are absent.
+
 Identity:
 
 | Layer | Key |
